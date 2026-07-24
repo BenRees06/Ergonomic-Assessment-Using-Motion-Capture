@@ -48,13 +48,16 @@ def process_hand_crop(image, wrist, elbow=None, depth=None):
         hand_scale = int(arm_length * 0.8)
 
 
-    if depth is not None:
-        # Reference distance where crop is unchanged
+    if depth is not None and depth > 0:
+
         ref_depth = 1.2  # metres
 
         scale = ref_depth / depth
 
-        hand_scale *= scale
+        # Prevent the crop becoming ridiculously large or tiny
+        scale = np.clip(scale, 0.5, 2.0)
+
+        hand_scale = int(hand_scale * scale)
 
 
     margin = 1.35
@@ -87,7 +90,26 @@ def process_hand_crop(image, wrist, elbow=None, depth=None):
     return results, (x1, y1, crop)
     
     
-    
+
+def get_xyz(point_cloud, x, y):
+
+    err, value = point_cloud.get_value(int(x), int(y))
+
+    if err != sl.ERROR_CODE.SUCCESS:
+        return None
+
+    X, Y, Z, A = value
+
+    if (not np.isfinite(X) or
+        not np.isfinite(Y) or
+        not np.isfinite(Z)):
+        return None
+
+    return np.array([X, Y, Z])
+
+
+
+
     
 if __name__ == "__main__":
     print("Running Body Tracking sample ... Press 'q' to quit")
@@ -150,6 +172,7 @@ if __name__ == "__main__":
     # Create ZED objects filled in the main loop
     bodies = sl.Objects()
     image = sl.Mat()
+    point_cloud = sl.Mat()
 
     frame_count = 0
     
@@ -160,10 +183,24 @@ if __name__ == "__main__":
         # Grab an image  
         if zed.grab() == sl.ERROR_CODE.SUCCESS:
             # Retrieve left image
-            zed.retrieve_image(image, sl.VIEW.LEFT, sl.MEM.CPU, display_resolution)
-            
-            # Retrieve objects
-            zed.retrieve_objects(bodies, obj_runtime_param)
+            zed.retrieve_image(
+                image,
+                sl.VIEW.LEFT,
+                sl.MEM.CPU,
+                display_resolution
+            )
+
+            zed.retrieve_measure(
+                point_cloud,
+                sl.MEASURE.XYZ,
+                sl.MEM.CPU,
+                display_resolution
+            )
+
+            zed.retrieve_objects(
+                bodies,
+                obj_runtime_param
+            )
                 
             
             # Update OCV view
@@ -173,60 +210,79 @@ if __name__ == "__main__":
             
             n = 1
             if frame_count % n == 0:
+            
+                hand_results = []
+            
                 if len(bodies.object_list) > 0:
 
                     body = bodies.object_list[0]
-
                     kp = body.keypoint_2d.copy()
+                    
+                    person = {
+                        "id": body.id,
+                        "body": [],
+                        "left_hand": None,
+                        "right_hand": None
+                    }
+
+
+
 
                     # Scale to match display image
                     kp[:,0] *= image_scale[0]
                     kp[:,1] *= image_scale[1]
+                    
+                    
+                    for joint in kp:
 
-                    hand_results = []
+                        xyz = get_xyz(
+                            point_cloud,
+                            joint[0],
+                            joint[1]
+                        )
+
+                        person["body"].append(xyz)
+                    
+                   
+                    # Right side
+                    right_wrist = kp[4]
+                    right_elbow = kp[3]
+
+                    # Left side
+                    left_wrist = kp[7]
+                    left_elbow = kp[6]
 
 
-                    if len(bodies.object_list) > 0:
+                    for side, wrist, elbow in [
+                        ("right_hand", right_wrist, right_elbow),
+                        ("left_hand", left_wrist, left_elbow)
+                    ]:
 
-                        body = bodies.object_list[0]
+                        wrist_xyz = get_xyz(
+                            point_cloud,
+                            wrist[0],
+                            wrist[1]
+                        )
 
-                        kp = body.keypoint_2d.copy()
+                        depth = None
 
-                        kp[:,0] *= image_scale[0]
-                        kp[:,1] *= image_scale[1]
+                        if wrist_xyz is not None:
+                            depth = wrist_xyz[2]
 
+                        result, data = process_hand_crop(
+                            image_left_ocv,
+                            wrist,
+                            elbow,
+                            depth
+                        )
 
-                        # Right side
-                        right_wrist = kp[4]
-                        right_elbow = kp[3]
-
-                        # Left side
-                        left_wrist = kp[7]
-                        left_elbow = kp[6]
-
-
-                        for wrist, elbow in [
-                            (right_wrist, right_elbow),
-                            (left_wrist, left_elbow)
-                        ]:
-
-                            if wrist[0] <= 0 or wrist[1] <= 0:
-                                continue
-
-                            result, data = process_hand_crop(
-                                image_left_ocv,
-                                wrist,
-                                elbow,
-                                wrist[2]
+                        if result is not None:
+                            hand_results.append(
+                                (side, result, data)
                             )
-
-                            if result is not None:
-                                hand_results.append(
-                                    (result, data)
-                                )
            
             frame_count += 1
-            results = last_hand_results
+
             
             #Convert for OpenCV drawing
             image_bgr = cv2.cvtColor(image_left_ocv, cv2.COLOR_BGRA2BGR)
@@ -242,7 +298,7 @@ if __name__ == "__main__":
             #Draw MediaPipe hands
             
                             
-            for results, data in hand_results:
+            for side, results, data in hand_results:
 
                 if results.multi_hand_landmarks:
 
@@ -250,28 +306,30 @@ if __name__ == "__main__":
 
                     for hand in results.multi_hand_landmarks:
 
+                        hand_xyz = []
+
                         for lm in hand.landmark:
 
-                            x = int(
-                                lm.x * crop.shape[1]
-                            ) + x_offset
+                            x = int(lm.x * crop.shape[1]) + x_offset
+                            y = int(lm.y * crop.shape[0]) + y_offset
 
-                            y = int(
-                                lm.y * crop.shape[0]
-                            ) + y_offset
+                            xyz = get_xyz(point_cloud, x, y)
+                            hand_xyz.append(xyz)
 
 
                             cv2.circle(
                                 image_bgr,
-                                (x,y),
+                                (x, y),
                                 3,
                                 (0,255,0),
                                 -1
                             )
+                        person[side] = hand_xyz
+
                             
                                         
             # show both cropped images                    
-            for i,(results,data) in enumerate(hand_results):
+            for i,(side,results,data) in enumerate(hand_results):
 
                 crop = data[2]
 
@@ -297,7 +355,7 @@ if __name__ == "__main__":
     # Disable modules and close camera
     
     image.free(sl.MEM.CPU)
-    
+    point_cloud.free(sl.MEM.CPU)
     zed.disable_object_detection()
     zed.disable_positional_tracking()
     zed.close()
